@@ -1,3 +1,4 @@
+# workflow-version: 1.0.1
 name: Enhanced Repository Analysis
 
 on:
@@ -12,340 +13,315 @@ on:
         required: false
         default: 'false'
         type: string
+      max_files:
+        description: 'Maximum files to analyze (0 = unlimited)'
+        required: false
+        default: '0'
+        type: string
+
+env:
+  WORKFLOW_VERSION: "1.0.1"
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # `write` (not `read`) is required here: if the GitHub App has been
+      # uninstalled (or this repo removed from it), the "Send analysis to
+      # external service" step below gets told to remove this very
+      # workflow file (see the "Remove workflow" step) using this job's
+      # own auto-issued GITHUB_TOKEN - contents:write is what lets that
+      # delete-and-commit call succeed.
+      contents: write
       actions: read
+    timeout-minutes: 30  # ⏱️ Hard limit for workflow
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
         with:
-          fetch-depth: 0
+          # For large repos, limit fetch depth
+          fetch-depth: ${{ github.event_name == 'push' && 50 || 0 }}
 
       - name: Setup Python
         uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: echo "✅ No external dependencies needed — using Python standard library only"
+      - name: Load webhook configuration
+        env:
+          WEBHOOK_CONFIG: ${{ secrets.WEBHOOK_CONFIG }}
+        run: |
+          if [ -z "$WEBHOOK_CONFIG" ]; then
+            echo "❌ WEBHOOK_CONFIG secret is not set!"
+            exit 1
+          fi
+
+          # WEBHOOK_CONFIG packs WEBHOOK_ENDPOINT :: WEBHOOK_API_TOKEN :: WEBSITE_BASE_URL
+          # joined by "::#?::". Split it back apart and export each part as
+          # a real env var so every later step (and the Python analyzer
+          # script it runs) can just read os.environ / $VAR as before.
+          mapfile -t PARTS <<< "$(printf '%s' "$WEBHOOK_CONFIG" | sed 's/::#?::/\n/g')"
+
+          WEBHOOK_ENDPOINT="${PARTS[0]}"
+          WEBHOOK_API_TOKEN="${PARTS[1]}"
+          BASE_URL="${PARTS[2]}"
+
+          if [ -z "$WEBHOOK_ENDPOINT" ] || [ -z "$WEBHOOK_API_TOKEN" ] || [ -z "$BASE_URL" ]; then
+            echo "❌ WEBHOOK_CONFIG is malformed (expected 3 parts split by '::#?::')"
+            exit 1
+          fi
+
+          # Mask the sensitive parts in the logs before exporting them.
+          echo "::add-mask::$WEBHOOK_API_TOKEN"
+          echo "::add-mask::$WEBHOOK_ENDPOINT"
+
+          {
+            echo "WEBHOOK_ENDPOINT=$WEBHOOK_ENDPOINT"
+            echo "WEBHOOK_API_TOKEN=$WEBHOOK_API_TOKEN"
+            echo "BASE_URL=$BASE_URL"
+            echo "WEBSITE_BASE_URL=$BASE_URL"
+          } >> "$GITHUB_ENV"
+
+          echo "✅ Webhook configuration loaded"
+
+      - name: Check GitHub App installation
+        id: check_install
+        run: |
+          # Cheap pre-flight against /webhook/status - answers "is the
+          # GitHub App still installed on this repo?" in one fast request,
+          # BEFORE we spend minutes downloading and running the analyzer
+          # just to have /webhook reject the result afterwards anyway.
+          echo "🔎 Checking whether the GitHub App is installed for this repository..."
+          HTTP_CODE=$(curl -L -X GET "$BASE_URL/webhook/status" \
+            -H "Accept: application/json" \
+            -H "X-API-Token: $WEBHOOK_API_TOKEN" \
+            -H "X-Repository: ${{ github.repository }}" \
+            -H "X-Workflow-Version: $WORKFLOW_VERSION" \
+            --max-time 30 \
+            --connect-timeout 15 \
+            --retry 2 \
+            --retry-delay 3 \
+            -s \
+            -o "$RUNNER_TEMP/status.json" \
+            -w "%{http_code}")
+
+          echo "📡 Response status: $HTTP_CODE"
+          echo "📌 Workflow version: $WORKFLOW_VERSION"
+          if [ -s "$RUNNER_TEMP/status.json" ]; then
+            echo "ℹ️ Server says: $(cat "$RUNNER_TEMP/status.json")"
+          fi
+
+          if [ "$HTTP_CODE" = "410" ]; then
+            echo "⛔ GitHub App is not installed for this repository - skipping analysis."
+            echo "app_uninstalled=true" >> "$GITHUB_OUTPUT"
+          else
+            # Any other response (200, or a transient network/5xx hiccup)
+            # fails OPEN - we proceed with the analysis as before, and
+            # /webhook's own check further down is still the authoritative
+            # gate on whether the result actually gets accepted.
+            echo "✅ Proceeding with analysis."
+            echo "app_uninstalled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check repository size
+        id: check_size
+        if: steps.check_install.outputs.app_uninstalled != 'true'
+        run: |
+          TOTAL_SIZE=$(du -sb . 2>/dev/null | cut -f1 || echo "0")
+          MAX_SIZE=$((100 * 1024 * 1024 * 1024))  # 100 GB max for auto-analysis
+          
+          if [ -n "$TOTAL_SIZE" ] && [ "$TOTAL_SIZE" -gt "$MAX_SIZE" ]; then
+            echo "⚠️ Repository size ($(($TOTAL_SIZE/1024/1024/1024)) GB) exceeds limit (100 GB). Skipping full analysis."
+            echo "LIMIT_EXCEEDED=true" >> $GITHUB_OUTPUT
+            echo "Skipping full analysis - use manual trigger for large repos"
+          else
+            echo "LIMIT_EXCEEDED=false" >> $GITHUB_OUTPUT
+            echo "SIZE_MB=$(($TOTAL_SIZE/1024/1024))" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download analyzer script
+        if: steps.check_install.outputs.app_uninstalled != 'true' && steps.check_size.outputs.LIMIT_EXCEEDED == 'false'
+        run: |
+          echo "📥 Downloading enhanced_analyzer.py from $BASE_URL/enhanced_analyzer.py"
+          curl -L -o enhanced_analyzer.py "$BASE_URL/enhanced_analyzer.py?t=$WEBHOOK_API_TOKEN" \
+            -H 'Accept: text/x-python' \
+            --connect-timeout 10 \
+            --max-time 60 \
+            --retry 3 \
+            --retry-delay 2
+
+          if [ ! -f enhanced_analyzer.py ]; then
+            echo '❌ Failed to download enhanced_analyzer.py'
+            exit 1
+          fi
+
+          LINE_COUNT=$(wc -l < enhanced_analyzer.py)
+          echo "✅ Downloaded enhanced_analyzer.py ($LINE_COUNT lines)"
 
       - name: Run enhanced repository analysis
+        if: steps.check_install.outputs.app_uninstalled != 'true' && steps.check_size.outputs.LIMIT_EXCEEDED == 'false'
         run: |
-          cat > enhanced_analyzer.py << 'PYTHON_SCRIPT'
-          import os
-          import json
-          import hashlib
-          import re
-          import urllib.request
-          from pathlib import Path
-          from collections import defaultdict
-          from datetime import datetime
-
-          # Fetch languages config using built-in urllib (no requests dependency)
-          try:
-              with urllib.request.urlopen('https://e44e-154-252-196-224.ngrok-free.app/languages.json') as response:
-                  LANGUAGES = json.loads(response.read().decode('utf-8'))
-          except Exception as e:
-              print(f"⚠️ Could not fetch languages.json: {e}")
-              LANGUAGES = {}
-
-          def get_language_from_extension(filename):
-              ext = Path(filename).suffix.lower()
-              for lang, info in LANGUAGES.items():
-                  if ext in info.get('extensions', []):
-                      return lang, info['name']
-              return 'unknown', 'Unknown'
-
-          def is_binary_file(filepath):
-              try:
-                  with open(filepath, 'tr') as check:
-                      check.read(1024)
-                      return False
-              except UnicodeDecodeError:
-                  return True
-
-          def count_lines_with_comments(content, language_key):
-              lines = content.splitlines()
-              total_lines = len(lines)
-              lang_info = LANGUAGES.get(language_key, {})
-              comment_regex_str = lang_info.get('comment_regex')
-
-              code_lines = 0
-              comment_lines = 0
-              empty_lines = 0
-              in_multiline_comment = False
-
-              comment_regex = None
-              if comment_regex_str:
-                  comment_regex = re.compile(comment_regex_str, re.MULTILINE)
-
-              for line in lines:
-                  stripped = line.strip()
-                  if not stripped:
-                      empty_lines += 1
-                      continue
-                  if in_multiline_comment:
-                      comment_lines += 1
-                      if '*/' in line:
-                          in_multiline_comment = False
-                      continue
-                  if '/*' in stripped and '*/' not in stripped:
-                      comment_lines += 1
-                      in_multiline_comment = True
-                      continue
-                  is_comment = False
-                  if comment_regex:
-                      if comment_regex.match(stripped):
-                          comment_lines += 1
-                          is_comment = True
-                  if not is_comment:
-                      code_lines += 1
-
-              return {
-                  'total_lines': total_lines,
-                  'code_lines': code_lines,
-                  'comment_lines': comment_lines,
-                  'empty_lines': empty_lines
-              }
-
-          def analyze_file(filepath):
-              rel_path = str(filepath.relative_to(Path.cwd()))
-              filename = filepath.name
-
-              if is_binary_file(filepath):
-                  return {
-                      'path': rel_path,
-                      'name': filename,
-                      'type': 'binary',
-                      'size': filepath.stat().st_size,
-                      'language': 'binary',
-                      'language_name': 'Binary'
-                  }
-
-              lang_key, lang_name = get_language_from_extension(filename)
-
-              try:
-                  with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                      content = f.read()
-
-                  lines_stats = count_lines_with_comments(content, lang_key)
-                  file_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
-
-                  return {
-                      'path': rel_path,
-                      'name': filename,
-                      'type': 'text',
-                      'size': filepath.stat().st_size,
-                      'language': lang_key,
-                      'language_name': lang_name,
-                      'hash': file_hash,
-                      'lines': lines_stats['total_lines'],
-                      'code_lines': lines_stats['code_lines'],
-                      'comment_lines': lines_stats['comment_lines'],
-                      'empty_lines': lines_stats['empty_lines']
-                  }
-              except Exception as e:
-                  print(f"Error analyzing {rel_path}: {e}")
-                  return None
-
-          print("🚀 Starting enhanced repository analysis...")
-
-          repo_full_name = os.environ.get('GITHUB_REPOSITORY', 'unknown')
-          event_name = os.environ.get('GITHUB_EVENT_NAME', 'unknown')
-          ref = os.environ.get('GITHUB_REF', 'unknown')
-          actor = os.environ.get('GITHUB_ACTOR', 'unknown')
-          sha = os.environ.get('GITHUB_SHA', 'unknown')
-          run_id = os.environ.get('GITHUB_RUN_ID', 'unknown')
-          run_number = os.environ.get('GITHUB_RUN_NUMBER', 'unknown')
-          run_attempt = os.environ.get('GITHUB_RUN_ATTEMPT', 'unknown')
-
-          repo_root = Path.cwd()
-          files_analyzed = []
-          language_stats = defaultdict(lambda: {
-              'files': 0,
-              'total_lines': 0,
-              'code_lines': 0,
-              'comment_lines': 0,
-              'empty_lines': 0,
-              'size': 0
-          })
-
-          exclude_dirs = {'.git', '.github', 'node_modules', '__pycache__', 'venv', 'env', '.venv', 'dist', 'build', '.next', '.nuxt'}
-          exclude_files = {'enhanced_analyzer.py', 'repo-analysis.yml', '.gitkeep'}
-
-          for filepath in repo_root.rglob('*'):
-              if filepath.is_file():
-                  should_exclude = any(excl in filepath.parts for excl in exclude_dirs)
-                  if should_exclude:
-                      continue
-
-                  if filepath.name in exclude_files:
-                      continue
-
-                  result = analyze_file(filepath)
-                  if result:
-                      files_analyzed.append(result)
-
-                      lang = result['language']
-                      if lang != 'binary':
-                          language_stats[lang]['files'] += 1
-                          language_stats[lang]['total_lines'] += result.get('lines', 0)
-                          language_stats[lang]['code_lines'] += result.get('code_lines', 0)
-                          language_stats[lang]['comment_lines'] += result.get('comment_lines', 0)
-                          language_stats[lang]['empty_lines'] += result.get('empty_lines', 0)
-                          language_stats[lang]['size'] += result.get('size', 0)
-
-          total_files = len(files_analyzed)
-          text_files = sum(1 for f in files_analyzed if f['type'] == 'text')
-          binary_files = total_files - text_files
-
-          total_code_lines = sum(stats['code_lines'] for stats in language_stats.values())
-          total_lines = sum(stats['total_lines'] for stats in language_stats.values())
-
-          languages = {}
-          for lang, stats in sorted(language_stats.items(), key=lambda x: x[1]['code_lines'], reverse=True):
-              lang_info = LANGUAGES.get(lang, {'name': lang.capitalize()})
-              languages[lang] = {
-                  'name': lang_info.get('name', lang.capitalize()),
-                  'files': stats['files'],
-                  'lines': stats['total_lines'],
-                  'code_lines': stats['code_lines'],
-                  'comment_lines': stats['comment_lines'],
-                  'empty_lines': stats['empty_lines'],
-                  'percentage': round((stats['code_lines'] / total_code_lines * 100), 2) if total_code_lines > 0 else 0,
-                  'size_mb': round(stats['size'] / (1024 * 1024), 2)
-              }
-
-          result = {
-              'repository': repo_full_name,
-              'full_name': repo_full_name,
-              'event': event_name,
-              'ref': ref,
-              'branch': ref.replace('refs/heads/', '') if ref.startswith('refs/heads/') else ref,
-              'actor': actor,
-              'commit_sha': sha,
-              'run_id': run_id,
-              'run_number': int(run_number),
-              'run_attempt': int(run_attempt),
-              'analyzed_at': datetime.utcnow().isoformat() + 'Z',
-              'summary': {
-                  'total_files': total_files,
-                  'text_files': text_files,
-                  'binary_files': binary_files,
-                  'total_lines': total_lines,
-                  'code_lines': total_code_lines,
-                  'comment_lines': sum(stats['comment_lines'] for stats in language_stats.values()),
-                  'empty_lines': sum(stats['empty_lines'] for stats in language_stats.values()),
-                  'unique_languages': len(languages),
-                  'total_size_mb': round(sum(f.get('size', 0) for f in files_analyzed) / (1024 * 1024), 2)
-              },
-              'languages': languages,
-              'files': files_analyzed[:500]
+          echo "🚀 Starting analysis..."
+          # Run with timeout protection
+          timeout 300 python3 enhanced_analyzer.py || {
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+              echo "⚠️ Analysis timed out after 300 seconds"
+              echo "Creating partial results..."
+            else
+              echo "❌ Analysis failed with exit code: $EXIT_CODE"
+              exit $EXIT_CODE
+            fi
           }
 
-          with open('enhanced_analysis_result.json', 'w', encoding='utf-8') as f:
-              json.dump(result, f, indent=2, ensure_ascii=False)
-
-          print(f"📊 Repository Analysis Complete:")
-          print(f"   Repository: {result['repository']}")
-          print(f"   Total Files: {result['summary']['total_files']}")
-          print(f"   Code Lines: {result['summary']['code_lines']:,}")
-          print(f"   Languages: {result['summary']['unique_languages']}")
-          print(f"   Total Size: {result['summary']['total_size_mb']} MB")
-          print(f"📈 Top 10 Languages by Code:")
-          for lang, stats in list(languages.items())[:10]:
-              print(f"   - {stats['name']}: {stats['code_lines']:,} lines ({stats['percentage']}%)")
-
-          PYTHON_SCRIPT
-
-          python3 enhanced_analyzer.py
+          # Check if results were generated
+          if [ -f "enhanced_analysis_result.json" ]; then
+            echo "✅ Analysis completed successfully"
+            FILE_SIZE=$(stat -c%s enhanced_analysis_result.json 2>/dev/null || stat -f%z enhanced_analysis_result.json 2>/dev/null || echo "0")
+            echo "📊 Results file size: $(($FILE_SIZE/1024)) KB"
+          else
+            echo "❌ No analysis results generated"
+            # Create minimal result file
+            echo '{
+              "error": "Analysis timed out or failed",
+              "repository": "${{ github.repository }}",
+              "summary": {
+                "total_files": 0,
+                "code_lines": 0
+              }
+            }' > enhanced_analysis_result.json
+          fi
 
       - name: Send analysis to external service
-        env:
-          WEBHOOK_ENDPOINT: ${{ secrets.WEBHOOK_ENDPOINT }}
-          WEBHOOK_API_TOKEN: ${{ secrets.WEBHOOK_API_TOKEN }}
+        id: send_analysis
+        if: steps.check_install.outputs.app_uninstalled != 'true'
         run: |
-          MAX_WAIT=5
-          WAIT_COUNT=0
-          until [ -n "$WEBHOOK_ENDPOINT" ] && [ -n "$WEBHOOK_API_TOKEN" ]; do
-            if [ "$WAIT_COUNT" -ge "$MAX_WAIT" ]; then
-              echo "❌ Secrets not available after ${MAX_WAIT} retries."
-              exit 1
-            fi
-            echo "⏳ Secrets not yet available — waiting 10 s (attempt $((WAIT_COUNT+1))/$MAX_WAIT)..."
-            sleep 10
-            WAIT_COUNT=$((WAIT_COUNT+1))
-            WEBHOOK_ENDPOINT="${{ secrets.WEBHOOK_ENDPOINT }}"
-            WEBHOOK_API_TOKEN="${{ secrets.WEBHOOK_API_TOKEN }}"
-          done
-
-          if [ -z "$WEBHOOK_ENDPOINT" ]; then
-            echo "❌ WEBHOOK_ENDPOINT secret is not set!"
+          # WEBHOOK_ENDPOINT / WEBHOOK_API_TOKEN were already split out of
+          # WEBHOOK_CONFIG and exported to $GITHUB_ENV by the "Load webhook
+          # configuration" step earlier in this job, so no waiting/retry
+          # loop is needed here anymore - if that step succeeded, these are
+          # guaranteed to be set.
+          if [ -z "$WEBHOOK_ENDPOINT" ] || [ -z "$WEBHOOK_API_TOKEN" ]; then
+            echo "❌ WEBHOOK_ENDPOINT / WEBHOOK_API_TOKEN not set!"
             exit 1
           fi
 
-          if [ -z "$WEBHOOK_API_TOKEN" ]; then
-            echo "❌ WEBHOOK_API_TOKEN secret is not set!"
-            exit 1
-          fi
-
-          if [ -f enhanced_analysis_result.json ]; then
-            echo "Sending analysis to $WEBHOOK_ENDPOINT"
-
-            temp_response=$(mktemp)
-
-            http_code=$(curl -L -X POST "$WEBHOOK_ENDPOINT"               -H "Content-Type: application/json"               -H "Accept: application/json"               -H "X-API-Token: $WEBHOOK_API_TOKEN"               -H "X-GitHub-Event: ${{ github.event_name }}"               -H "X-Repository: ${{ github.repository }}"               -H "X-Run-ID: ${{ github.run_id }}"               -d @enhanced_analysis_result.json               --max-time 30               --connect-timeout 10               -w "%{http_code}"               -o "$temp_response"               -s               --location               --fail               2>&1) || true
-
-            if [ -f "$temp_response" ]; then
-              response_body=$(cat "$temp_response")
-
-              if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-                echo "✅ Analysis sent successfully (HTTP $http_code)"
-                echo "Response: $response_body"
-              else
-                echo "❌ Failed to send analysis (HTTP $http_code)"
-                echo "Response: $response_body"
-
-                if [ -n "$WEBHOOK_ENDPOINT" ] && [ "$WEBHOOK_ENDPOINT" != "/" ]; then
-                  if [[ "$WEBHOOK_ENDPOINT" == */ ]]; then
-                    alt_endpoint="${WEBHOOK_ENDPOINT%/}"
-                  else
-                    alt_endpoint="${WEBHOOK_ENDPOINT}/"
-                  fi
-
-                  echo "Retrying with alternative endpoint: $alt_endpoint"
-                  http_code2=$(curl -L -X POST "$alt_endpoint"                     -H "Content-Type: application/json"                     -H "Accept: application/json"                     -H "X-API-Token: $WEBHOOK_API_TOKEN"                     -d @enhanced_analysis_result.json                     --max-time 30                     -w "%{http_code}"                     -o "$temp_response"                     -s                     --location)
-
-                  if [ "$http_code2" -ge 200 ] && [ "$http_code2" -lt 300 ]; then
-                    echo "✅ Analysis sent successfully on retry (HTTP $http_code2)"
-                    echo "Response: $(cat "$temp_response")"
-                  else
-                    echo "❌ Failed to send analysis on retry (HTTP $http_code2)"
-                    cat "$temp_response"
-                    exit 1
-                  fi
-                else
-                  echo "❌ Cannot retry: WEBHOOK_ENDPOINT is empty or invalid"
-                  exit 1
-                fi
-              fi
-
-              rm -f "$temp_response"
-            else
-              echo "❌ No response received"
-              exit 1
-            fi
-          else
+          if [ ! -f "enhanced_analysis_result.json" ]; then
             echo "❌ Analysis file not found"
             exit 1
           fi
 
+          # Sends the analysis payload to $1 and prints ONLY the HTTP
+          # status code (body is discarded) - used below to tell a normal
+          # failure apart from a 410, which means "the GitHub App is not
+          # installed here anymore, stop running this workflow".
+          send_analysis() {
+            curl -L -X POST "$1" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -H "X-API-Token: $WEBHOOK_API_TOKEN" \
+              -H "X-GitHub-Event: ${{ github.event_name }}" \
+              -H "X-Repository: ${{ github.repository }}" \
+              -H "X-Run-ID: ${{ github.run_id }}" \
+              -d @enhanced_analysis_result.json \
+              --max-time 60 \
+              --connect-timeout 15 \
+              --retry 2 \
+              --retry-delay 5 \
+              -s \
+              -o /dev/null \
+              -w "%{http_code}"
+          }
+
+          echo "📤 Sending analysis to $WEBHOOK_ENDPOINT"
+          HTTP_CODE=$(send_analysis "$WEBHOOK_ENDPOINT")
+          echo "📡 Response status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" = "410" ]; then
+            echo "⛔ GitHub App is not installed for this repository (anymore)."
+            echo "app_uninstalled=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "❌ Failed to send analysis (HTTP $HTTP_CODE)"
+
+            # Try alternative endpoint
+            if [[ "$WEBHOOK_ENDPOINT" == */ ]]; then
+              ALT_ENDPOINT="${WEBHOOK_ENDPOINT%/}"
+            else
+              ALT_ENDPOINT="${WEBHOOK_ENDPOINT}/"
+            fi
+            echo "🔄 Retrying with alternative endpoint: $ALT_ENDPOINT"
+            HTTP_CODE=$(send_analysis "$ALT_ENDPOINT")
+            echo "📡 Retry response status: $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "410" ]; then
+              echo "⛔ GitHub App is not installed for this repository (anymore)."
+              echo "app_uninstalled=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "❌ Failed to send analysis on retry (HTTP $HTTP_CODE)"
+              echo "app_uninstalled=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          fi
+
+          echo "✅ Analysis sent successfully"
+          echo "app_uninstalled=false" >> "$GITHUB_OUTPUT"
+
+      - name: Remove workflow (GitHub App not installed)
+        if: steps.check_install.outputs.app_uninstalled == 'true' || steps.send_analysis.outputs.app_uninstalled == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          WORKFLOW_FILE=".github/workflows/repo-analysis.yml"
+          echo "🛑 The GitHub App is no longer installed for this repository."
+          echo "🗑️ Attempting to remove $WORKFLOW_FILE so this workflow stops running automatically."
+
+          SHA=$(gh api "/repos/${{ github.repository }}/contents/$WORKFLOW_FILE?ref=${{ github.ref_name }}" --jq .sha 2>/dev/null)
+
+          if [ -z "$SHA" ]; then
+            echo "ℹ️ $WORKFLOW_FILE already gone - nothing to remove."
+            exit 0
+          fi
+
+          DELETE_OUTPUT=$(gh api --method DELETE             "/repos/${{ github.repository }}/contents/$WORKFLOW_FILE"             -f message="chore: remove automated analysis workflow (GitHub App not installed)"             -f sha="$SHA"             -f branch="${{ github.ref_name }}" 2>&1)
+          DELETE_STATUS=$?
+
+          if [ $DELETE_STATUS -eq 0 ]; then
+            echo "✅ Workflow removed. Reinstall the app from your dashboard to re-enable automatic analysis."
+            exit 0
+          fi
+
+          # Most common cause: GITHUB_TOKEN is capped at read-only by this
+          # repo's own Actions settings - the "permissions: contents: write"
+          # block above can only ever narrow the token, never exceed the
+          # repo/org's own ceiling. Report it clearly instead of leaving a
+          # bare 403 in the log, and don't fail the whole job for it: the
+          # part that actually matters (no analysis data was accepted /
+          # no credits were spent) already happened successfully.
+          echo "⚠️ Could not delete $WORKFLOW_FILE automatically: $DELETE_OUTPUT"
+          echo ""
+          echo "This is almost always caused by this repository's Actions permissions,"
+          echo "not by anything in the workflow itself. To let this step delete the file"
+          echo "automatically next time:"
+          echo "  1. Go to this repo's Settings -> Actions -> General"
+          echo "  2. Under 'Workflow permissions', select 'Read and write permissions'"
+          echo "  3. Save"
+          echo ""
+          echo "Until then, no repository data is being sent or stored (the GitHub App"
+          echo "is not installed here), but you'll need to delete $WORKFLOW_FILE by hand"
+          echo "if you'd like this workflow to stop appearing in the Actions tab."
+          exit 0
+
       - name: Upload analysis artifact
+        if: steps.check_install.outputs.app_uninstalled != 'true' && steps.send_analysis.outputs.app_uninstalled != 'true'
         uses: actions/upload-artifact@v4.6.2
         with:
           name: enhanced-analysis-${{ github.run_id }}
